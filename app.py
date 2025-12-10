@@ -5,9 +5,11 @@ import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler
 from sklearn.decomposition import PCA
 from sklearn.datasets import make_blobs, make_moons, make_circles
+from sklearn.metrics import silhouette_score, davies_bouldin_score
 import seaborn as sns
 from matplotlib.patches import Ellipse, Rectangle
 import warnings
+import time
 warnings.filterwarnings('ignore')
 
 # Configuration de style
@@ -36,6 +38,9 @@ class NueesDynamiques:
         self.cluster_axes = None
         self.cluster_distributions = None
         self.history = []
+        self.execution_time = 0
+        self.silhouette_score = None
+        self.davies_bouldin_score = None
     
     def _initialize_representation(self, X):
         np.random.seed(self.random_state)
@@ -199,6 +204,8 @@ class NueesDynamiques:
         return total_shift
     
     def fit(self, X):
+        start_time = time.time()
+        
         self.representation = self._initialize_representation(X)
         self.history = [{'representation': self.representation.copy(), 'labels': None}]
         
@@ -220,6 +227,20 @@ class NueesDynamiques:
             
             if shift < self.tolerance:
                 break
+        
+        self.execution_time = (time.time() - start_time) * 1000  # en millisecondes
+        
+        # Calculer les métriques
+        try:
+            self.silhouette_score = silhouette_score(X, self.labels)
+        except:
+            self.silhouette_score = None
+        
+        try:
+            self.davies_bouldin_score = davies_bouldin_score(X, self.labels)
+        except:
+            self.davies_bouldin_score = None
+        
         return self
     
     def predict(self, X):
@@ -227,7 +248,6 @@ class NueesDynamiques:
     
     def calculate_inertia(self, X):
         """Calculate inertia (within-cluster sum of squares)"""
-        # Vérifier que les dimensions correspondent
         if len(self.labels) != X.shape[0]:
             raise ValueError(f"Dimension mismatch: labels length ({len(self.labels)}) != X samples ({X.shape[0]})")
         
@@ -377,7 +397,6 @@ def plot_clustering(X, model, feature_names=None):
     elif model.representation_type == 'distribution' and 'distributions_2d' in locals():
         for i, dist in enumerate(distributions_2d):
             if dist['type'] == 'gaussian':
-                # Vérifier que 'cov' existe
                 if 'cov' in dist:
                     eigenvalues, eigenvectors = np.linalg.eig(dist['cov'])
                     angle = np.degrees(np.arctan2(eigenvectors[1, 0], eigenvectors[0, 0]))
@@ -388,24 +407,20 @@ def plot_clustering(X, model, feature_names=None):
                     ax.scatter(dist['mean'][0], dist['mean'][1], c='red', marker='D', s=100,
                               edgecolors='black', linewidths=2, zorder=5, label='Gaussian mean' if i == 0 else "")
                 else:
-                    # Fallback: juste afficher la moyenne
                     ax.scatter(dist['mean'][0], dist['mean'][1], c='red', marker='D', s=100,
                               edgecolors='black', linewidths=2, zorder=5)
             
             else:  # distribution uniforme
                 if 'min' in dist and 'max' in dist:
-                    # Dessiner un rectangle pour la distribution uniforme
                     min_x, min_y = dist['min'][0], dist['min'][1]
                     max_x, max_y = dist['max'][0], dist['max'][1]
                     width = max_x - min_x
                     height = max_y - min_y
                     
-                    # Dessiner le rectangle
                     rect = Rectangle((min_x, min_y), width, height,
                                    alpha=0.2, color=colors[i], linewidth=2, linestyle='--')
                     ax.add_patch(rect)
                     
-                    # Dessiner le centre
                     center_x = (min_x + max_x) / 2
                     center_y = (min_y + max_y) / 2
                     ax.scatter(center_x, center_y, c='red', marker='s', s=100,
@@ -557,7 +572,7 @@ def main():
             
             # Paramètres conditionnels
             if representation_type == 'etalons':
-                n_etalons = st.slider("Étalons per cluster", 1, 20, 5, key="n_etalons")
+                n_etalons = st.slider("Étalons per cluster", 2, 20, 5, key="n_etalons")
                 aggregation_type = st.selectbox("Aggregation function", ["simple", "diday"], 
                                                format_func=lambda x: "Simple" if x == "simple" else "Diday (original)",
                                                key="agg_type")
@@ -599,7 +614,7 @@ def main():
                         
                         # Sauvegarder les résultats
                         st.session_state.model = model
-                        st.session_state.X_for_model = X.copy()  # Sauvegarder les données utilisées
+                        st.session_state.X_for_model = X.copy()
                         st.session_state.clustering_done = True
                         st.session_state.model_params = model_params
                         st.success("✅ Clustering completed!")
@@ -678,17 +693,14 @@ def main():
                 # Vérifier si les données correspondent
                 if X_for_model is not None and X is not None:
                     if X_for_model.shape[0] == X.shape[0]:
-                        # Les données correspondent, afficher les résultats
                         pass
                     else:
-                        # Les données ne correspondent pas
                         st.warning("⚠️ The clustering was performed on different data. Please run clustering again.")
                         st.session_state.clustering_done = False
                         st.session_state.model = None
                         st.session_state.X_for_model = None
                         st.stop()
                 else:
-                    # Pas de données sauvegardées
                     st.warning("⚠️ No saved data found for this model. Please run clustering again.")
                     st.session_state.clustering_done = False
                     st.session_state.model = None
@@ -701,21 +713,23 @@ def main():
                 # Métriques
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
-                    st.metric("Number of Clusters", model.k)
+                    if model.silhouette_score is not None:
+                        st.metric("Silhouette Score", f"{model.silhouette_score:.4f}")
+                    else:
+                        st.metric("Silhouette Score", "N/A")
                 with col2:
+                    st.metric("Execution Time", f"{model.execution_time:.2f} ms")
+                with col3:
                     try:
                         inertia = model.calculate_inertia(X_for_model)
                         st.metric("Inertia", f"{inertia:.2f}")
                     except Exception as e:
                         st.metric("Inertia", "N/A")
-                        st.error(f"Cannot compute inertia: {str(e)}")
-                with col3:
-                    st.metric("Iterations", len(model.history) - 1)
                 with col4:
-                    if model.representation_type == 'etalons':
-                        st.metric("Étalons/Cluster", model.n_etalons[0])
+                    if model.davies_bouldin_score is not None:
+                        st.metric("Davies-Bouldin Index", f"{model.davies_bouldin_score:.4f}")
                     else:
-                        st.metric("Representation", model.representation_type.capitalize())
+                        st.metric("Davies-Bouldin Index", "N/A")
                 
                 # Info sur la représentation
                 st.subheader("🎯 Representation Details")
@@ -768,12 +782,8 @@ def main():
                     stats = {
                         'Cluster': f"C{i+1}",
                         'Size': size,
-                        'Percentage': f"{percentage:.1f}%",
-                        'Color': f"Cluster {i+1}"
+                        'Percentage': f"{percentage:.1f}%"
                     }
-                    
-                    if model.representation_type == 'etalons':
-                        stats['Étalons'] = len(model.etalons[i])
                     
                     cluster_stats.append(stats)
                 
@@ -863,7 +873,7 @@ def main():
         et reconnaissance des formes: la méthode des nuées dynamiques*. Revue de Statistique Appliquée, 19(2), 19-33.
         """)
         
-        # Quick actions - version corrigée
+        # Quick actions
         st.markdown("---")
         col1, col2 = st.columns(2)
         
