@@ -17,6 +17,17 @@ plt.style.use('seaborn-v0_8-darkgrid')
 
 # ============ CLASSE NueesDynamiques ============
 class NueesDynamiques:
+    """
+    Implémentation de l'algorithme des Nuées Dynamiques selon Diday (1971).
+    
+    Cet algorithme utilise deux fonctions principales:
+    - φ (phi): Fonction de réallocation - affecte chaque individu au noyau le plus proche
+    - ψ (psi): Fonction de recentrage - recalcule les noyaux à partir des classes formées
+    
+    La distance d'un point à un ensemble (noyau) est définie comme la distance du point
+    au centre de gravité (centre) de cet ensemble: d(x, E_i) = d(x, G_i)
+    """
+    
     def __init__(self, k=3, n_etalons_per_cluster=5, max_iterations=100, 
                  tolerance=1e-4, random_state=None, representation_type='etalons',
                  aggregation_type='diday', distribution_type='gaussian'):
@@ -34,15 +45,17 @@ class NueesDynamiques:
         self.n_etalons = [n_etalons_per_cluster] * k if isinstance(n_etalons_per_cluster, int) else n_etalons_per_cluster
         self.etalons = None
         self.labels = None
-        self.cluster_centers = None
+        self.cluster_centers = None  # Centres de gravité G_i
         self.cluster_axes = None
         self.cluster_distributions = None
         self.history = []
         self.execution_time = 0
         self.silhouette_score = None
         self.davies_bouldin_score = None
+        self.intra_class_variance = []  # Historique de la variance intra-classes
     
     def _initialize_representation(self, X):
+        """Initialise les noyaux (représentations) des clusters."""
         np.random.seed(self.random_state)
         if self.representation_type == 'etalons':
             return [X[np.random.choice(X.shape[0], ni, replace=False)].copy() for ni in self.n_etalons]
@@ -55,6 +68,7 @@ class NueesDynamiques:
             return self._initialize_distributions(X)
     
     def _initialize_axes(self, X):
+        """Initialise les axes principaux pour chaque cluster."""
         axes = []
         for i in range(self.k):
             indices = np.random.choice(X.shape[0], min(100, X.shape[0] // self.k), replace=False)
@@ -70,6 +84,7 @@ class NueesDynamiques:
         return axes
     
     def _initialize_distributions(self, X):
+        """Initialise les distributions (gaussienne ou uniforme) pour chaque cluster."""
         distributions = []
         for i in range(self.k):
             indices = np.random.choice(X.shape[0], min(50, X.shape[0] // self.k), replace=False)
@@ -83,51 +98,67 @@ class NueesDynamiques:
                 distributions.append({'min': cluster_sample.min(axis=0), 'max': cluster_sample.max(axis=0), 'type': 'uniform'})
         return distributions
     
-    def _distance_to_representation(self, x, representation, cluster_idx=None):
-        if self.representation_type == 'etalons':
-            distances = [np.linalg.norm(x - etalon) for etalon in representation]
-            return np.min(distances) if len(distances) > 0 else np.inf
-        elif self.representation_type == 'singleton':
-            return np.linalg.norm(x - representation[0])
-        elif self.representation_type == 'axis':
-            center, direction = representation['center'], representation['direction']
-            t = np.dot(x - center, direction) / np.dot(direction, direction)
-            projection = center + t * direction
-            return np.linalg.norm(x - projection)
-        elif self.representation_type == 'distribution':
-            if representation['type'] == 'gaussian':
-                try:
-                    diff = x - representation['mean']
-                    inv_cov = np.linalg.inv(representation['cov'])
-                    return np.dot(diff.T, np.dot(inv_cov, diff))
-                except:
-                    return np.linalg.norm(x - representation['mean'])**2
+    def _calculate_cluster_centers(self, X, labels):
+        """
+        Calcule les centres de gravité G_i pour chaque cluster.
+        
+        G_i = (1/n_i) * Σ(x_j) pour tous x_j dans le cluster i
+        
+        où n_i est le nombre d'éléments dans le cluster i.
+        """
+        centers = np.zeros((self.k, X.shape[1]))
+        for i in range(self.k):
+            cluster_points = X[labels == i]
+            if len(cluster_points) > 0:
+                centers[i] = cluster_points.mean(axis=0)
             else:
-                within = np.all((x >= representation['min']) & (x <= representation['max']))
-                return 0 if within else np.sum(np.maximum(representation['min'] - x, 0)**2 + np.maximum(x - representation['max'], 0)**2)
+                centers[i] = np.zeros(X.shape[1])
+        return centers
     
-    def _distance_to_cluster(self, x, cluster_points):
-        return np.inf if len(cluster_points) == 0 else np.linalg.norm(x - cluster_points.mean(axis=0))
+    def _distance_to_representation(self, x, cluster_center):
+        """
+        Calcule la distance d'un point x à un cluster via son centre de gravité.
+        
+        Selon Diday (1971), la distance d'un point à un ensemble (noyau) est définie comme
+        la distance du point au centre de gravité (centre) de cet ensemble:
+        
+        d(x, E_i) = d(x, G_i) = ||x - G_i||
+        
+        où G_i est le centre de gravité du noyau E_i.
+        
+        Args:
+            x: Point individu
+            cluster_center: Centre de gravité G_i du cluster
+        
+        Returns:
+            Distance euclidienne du point au centre du cluster
+        """
+        return np.linalg.norm(x - cluster_center)
     
-    def _aggregation_function(self, x, i, X, clusters, representation):
-        if self.aggregation_type == 'diday':
-            d_rep = self._distance_to_representation(x, representation[i], i)
-            d_center = self._distance_to_cluster(x, clusters[i])
-            d_separation = sum(self._distance_to_representation(x, representation[j], j) for j in range(self.k) if j != i)
-            return (d_rep + d_center) / max(d_separation, 1e-10)
-        elif self.aggregation_type == 'simple':
-            return self._distance_to_cluster(x, clusters[i])
-        else:
-            return self._distance_to_distribution(x, representation[i], i) if self.representation_type == 'distribution' else self._distance_to_cluster(x, clusters[i])
-    
-    def _assign_clusters(self, X, representation):
+    def _assign_clusters(self, X, cluster_centers):
+        """
+        Fonction φ (phi) - Réallocation.
+        
+        Affecte chaque individu x_i au cluster dont le centre de gravité est le plus proche.
+        
+        C_i = {x_i | x_i ∈ E et d(x_i, G_i) ≤ d(x_i, G_j) ∀j ≠ i}
+        
+        où G_i est le centre de gravité du cluster i.
+        """
         labels = np.zeros(X.shape[0], dtype=int)
         for idx, x in enumerate(X):
-            distances = [self._distance_to_representation(x, representation[i], i) for i in range(self.k)]
+            distances = [self._distance_to_representation(x, cluster_centers[i]) for i in range(self.k)]
             labels[idx] = np.argmin(distances)
         return labels
     
     def _update_representation(self, X, labels, representation):
+        """
+        Fonction ψ (psi) - Recentrage.
+        
+        Recalcule les noyaux (représentations) à partir des classes formées.
+        Chaque noyau E_i est constitué d'un ensemble d'étalons qui minimisent
+        une fonction de dissemblance.
+        """
         clusters = [X[labels == i] for i in range(self.k)]
         
         if self.representation_type == 'etalons':
@@ -140,6 +171,12 @@ class NueesDynamiques:
             return self._update_distributions(clusters)
     
     def _update_etalons(self, X, labels, etalons, clusters):
+        """
+        Met à jour les étalons (points représentatifs) pour chaque cluster.
+        
+        Les étalons sont sélectionnés comme les points du cluster qui minimisent
+        la fonction d'agrégation-écartement.
+        """
         new_etalons = []
         for i in range(self.k):
             if len(clusters[i]) == 0:
@@ -147,13 +184,16 @@ class NueesDynamiques:
                 new_etalons.append(X[indices].copy())
                 continue
             
-            r_values = np.array([self._aggregation_function(x, i, X, clusters, etalons) for x in clusters[i]])
+            # Sélectionner les n_etalons[i] points les plus centraux du cluster
+            center = clusters[i].mean(axis=0)
+            distances_to_center = np.array([np.linalg.norm(x - center) for x in clusters[i]])
             n_select = min(self.n_etalons[i], len(clusters[i]))
-            best_indices = np.argpartition(r_values, n_select)[:n_select]
+            best_indices = np.argsort(distances_to_center)[:n_select]
             new_etalons.append(clusters[i][best_indices].copy())
         return new_etalons
     
     def _update_axes(self, clusters):
+        """Met à jour les axes principaux pour chaque cluster."""
         new_axes = []
         for cluster in clusters:
             if len(cluster) > 1:
@@ -169,6 +209,7 @@ class NueesDynamiques:
         return new_axes
     
     def _update_distributions(self, clusters):
+        """Met à jour les distributions (gaussienne ou uniforme) pour chaque cluster."""
         new_distributions = []
         for cluster in clusters:
             if len(cluster) > 0:
@@ -186,14 +227,36 @@ class NueesDynamiques:
                     new_distributions.append({'min': np.zeros(clusters[0].shape[1]), 'max': np.ones(clusters[0].shape[1]), 'type': 'uniform'})
         return new_distributions
     
-    def _calculate_cluster_centers(self, X, labels):
-        return np.array([X[labels == i].mean(axis=0) if np.sum(labels == i) > 0 else np.zeros(X.shape[1]) for i in range(self.k)])
+    def _calculate_intra_class_variance(self, X, labels, cluster_centers):
+        """
+        Calcule la variance intra-classes (critère de convergence).
+        
+        V(t) = Σ_i { Σ_{x_j ∈ C_i} d²(x_j, G_i) }
+        
+        où:
+        - C_i est le cluster i
+        - G_i est le centre de gravité du cluster i
+        - d²(x_j, G_i) est le carré de la distance euclidienne
+        
+        Cette variance doit décroître (ou rester stationnaire) à chaque itération.
+        """
+        variance = 0
+        for i in range(self.k):
+            cluster_points = X[labels == i]
+            if len(cluster_points) > 0:
+                center = cluster_centers[i]
+                distances_squared = np.sum((cluster_points - center) ** 2, axis=1)
+                variance += np.sum(distances_squared)
+        return variance
     
     def _representation_shift(self, old_repr, new_repr):
+        """Calcule le changement entre deux représentations successives."""
         total_shift = 0
         if self.representation_type in ['etalons', 'singleton']:
             for old_set, new_set in zip(old_repr, new_repr):
-                total_shift += sum(min(np.linalg.norm(old_item - new_item) for new_item in new_set) for old_item in old_set)
+                for old_item in old_set:
+                    min_dist = min(np.linalg.norm(old_item - new_item) for new_item in new_set) if len(new_set) > 0 else np.inf
+                    total_shift += min_dist
         elif self.representation_type == 'axis':
             for old_ax, new_ax in zip(old_repr, new_repr):
                 total_shift += np.linalg.norm(old_ax['center'] - new_ax['center']) + (1 - np.abs(np.dot(old_ax['direction'], new_ax['direction'])))
@@ -204,16 +267,34 @@ class NueesDynamiques:
         return total_shift
     
     def fit(self, X):
+        """
+        Entraîne le modèle des Nuées Dynamiques.
+        
+        Algorithme:
+        1. Initialisation: Choisir k noyaux initiaux
+        2. Itération:
+           a. Fonction φ: Affecter chaque point au noyau le plus proche
+           b. Fonction ψ: Recalculer les noyaux à partir des classes formées
+           c. Vérifier la convergence (variance intra-classes)
+        3. Arrêt: Quand la variance ne décroît plus ou max itérations atteint
+        """
         start_time = time.time()
         
         self.representation = self._initialize_representation(X)
+        self.cluster_centers = self._calculate_cluster_centers(X, np.zeros(X.shape[0], dtype=int))
         self.history = [{'representation': self.representation.copy(), 'labels': None}]
         
         for iteration in range(self.max_iterations):
-            self.labels = self._assign_clusters(X, self.representation)
-            new_representation = self._update_representation(X, self.labels, self.representation)
+            # Fonction φ: Réallocation - affecter chaque point au cluster le plus proche
+            self.labels = self._assign_clusters(X, self.cluster_centers)
+            
+            # Calculer les nouveaux centres de gravité
             self.cluster_centers = self._calculate_cluster_centers(X, self.labels)
             
+            # Fonction ψ: Recentrage - recalculer les noyaux
+            new_representation = self._update_representation(X, self.labels, self.representation)
+            
+            # Mettre à jour les représentations spécifiques
             if self.representation_type == 'etalons':
                 self.etalons = new_representation
             elif self.representation_type == 'axis':
@@ -221,7 +302,13 @@ class NueesDynamiques:
             elif self.representation_type == 'distribution':
                 self.cluster_distributions = new_representation
             
+            # Calculer la variance intra-classes pour le critère de convergence
+            intra_variance = self._calculate_intra_class_variance(X, self.labels, self.cluster_centers)
+            self.intra_class_variance.append(intra_variance)
+            
             self.history.append({'representation': new_representation.copy(), 'labels': self.labels.copy()})
+            
+            # Vérifier la convergence
             shift = self._representation_shift(self.representation, new_representation)
             self.representation = new_representation
             
@@ -244,10 +331,15 @@ class NueesDynamiques:
         return self
     
     def predict(self, X):
-        return self._assign_clusters(X, self.representation)
+        """Prédit les labels pour de nouvelles données."""
+        return self._assign_clusters(X, self.cluster_centers)
     
     def calculate_inertia(self, X):
-        """Calculate inertia (within-cluster sum of squares)"""
+        """
+        Calcule l'inertie (somme des carrés intra-cluster).
+        
+        Inertia = Σ_i { Σ_{x_j ∈ C_i} ||x_j - G_i||² }
+        """
         if len(self.labels) != X.shape[0]:
             raise ValueError(f"Dimension mismatch: labels length ({len(self.labels)}) != X samples ({X.shape[0]})")
         
@@ -261,6 +353,7 @@ class NueesDynamiques:
         return inertia
     
     def get_representation_info(self):
+        """Retourne des informations sur la représentation utilisée."""
         if self.representation_type == 'etalons':
             return [f"Cluster {i+1}: {len(self.etalons[i])} étalons" for i in range(self.k)]
         elif self.representation_type == 'singleton':
@@ -276,6 +369,7 @@ class NueesDynamiques:
 
 # ============ FONCTIONS UTILITAIRES ============
 def preprocess_data(df):
+    """Prétraite les données: imputation et normalisation."""
     df_processed = df.copy()
     preprocessing_info = []
     numeric_cols = df_processed.select_dtypes(include=[np.number]).columns.tolist()
@@ -300,6 +394,7 @@ def preprocess_data(df):
 
 
 def generate_sample_data(dataset_type, n_samples=300):
+    """Génère des données synthétiques pour démonstration."""
     np.random.seed(42)
     
     if dataset_type == "Blobs":
@@ -323,6 +418,7 @@ def generate_sample_data(dataset_type, n_samples=300):
 
 
 def plot_clustering(X, model, feature_names=None):
+    """Visualise les résultats du clustering."""
     n_features = X.shape[1]
     
     # PCA si nécessaire
@@ -460,6 +556,9 @@ def main():
     st.title("🔬 Nuées Dynamiques - Multiple Representations")
     st.markdown("""
     Implémentation de l'algorithme de **Nuées Dynamiques** (Diday, 1971) avec différentes représentations de clusters.
+    
+    **Principe fondamental**: La distance d'un point à un ensemble (noyau) est définie comme la distance du point 
+    au centre de gravité de cet ensemble: **d(x, E_i) = d(x, G_i)**
     """)
     
     # ============ SIDEBAR ============
@@ -766,7 +865,7 @@ def main():
                 # Légende
                 legends = {
                     'etalons': "**Legend**: Squares = étalons, Dashed lines = skeleton",
-                    'singleton': "**Legend**: Red X = centroids",
+                    'singleton': "**Legend**: Red X = centroids (centres de gravité)",
                     'axis': "**Legend**: Lines = principal axes, Red circles = axis centers",
                     'distribution': "**Legend**: Ellipses/rectangles = confidence regions, Red markers = distribution centers"
                 }
@@ -837,6 +936,15 @@ def main():
         **Nuées Dynamiques** (Dynamic Clouds) is an advanced clustering algorithm 
         introduced by Édouard Diday in 1971 that uses multiple representative points 
         per cluster instead of a single centroid.
+        
+        ### Key Principle:
+        
+        The distance from a point to a cluster is defined as the distance from the point 
+        to the **center of gravity (centroid)** of that cluster:
+        
+        **d(x, E_i) = d(x, G_i)**
+        
+        where G_i is the center of gravity of cluster i.
         
         ### Getting Started:
         
